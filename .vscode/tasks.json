@@ -1,0 +1,47 @@
+{
+    "tasks": [
+        {
+            "type": "cppbuild",
+            "label": "C/C++: g++.exe 生成活动文件",
+            "command": "D:/QT/QTcreator/Tools/mingw1310_64/bin/g++.exe",
+            "args": [
+                "-fdiagnostics-color=always",
+                "-g",
+                "${file}",
+                "${workspaceFolder}/rgdic.cpp",
+                "-I", "D:/Opencv-4.1.0.0/OpenCV-MinGW-Build-OpenCV-4.1.0-x64/include",  // 包含路径   头文件   编译的时候到这个路径下找头文件  编译审生成可重定位文件
+				"-L", "D:/Opencv-4.1.0.0/OpenCV-MinGW-Build-OpenCV-4.1.0-x64/x64/mingw/bin", // 库路径   动态链接库地址，可执行文件运行起来需要这些库提供的机器码
+				// "-l","libopencv_world4100",           // 链接需要使用这些dll作为可重定位文件
+				"-l","libopencv_calib3d410",
+				"-l","libopencv_core410",
+				"-l","libopencv_dnn410",
+				"-l","libopencv_features2d410",
+				"-l","libopencv_flann410",
+				"-l","libopencv_gapi410",
+				"-l","libopencv_highgui410",
+				"-l","libopencv_imgcodecs410",
+				"-l","libopencv_imgproc410",
+				"-l","libopencv_ml410",
+				"-l","libopencv_photo410",
+                "-l","libopencv_stitching410",
+                "-l","libopencv_video410",
+				"-l","libopencv_videoio410",
+				"-l","libopencv_objdetect410",
+                "-o",
+                "${fileDirname}/${fileBasenameNoExtension}.exe"
+            ],
+            "options": {
+                "cwd": "D:/QT/QTcreator/Tools/mingw1310_64/bin"
+            },
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "detail": "调试器生成的任务。"
+        }
+    ],
+    "version": "2.0.0"
+}
