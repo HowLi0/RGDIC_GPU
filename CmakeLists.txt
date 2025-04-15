@@ -1,0 +1,61 @@
+cmake_minimum_required(VERSION 3.10)
+project(RGDIC_GPU LANGUAGES CXX CUDA)
+
+# Set C++ standard
+set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Find dependencies
+find_package(OpenCV REQUIRED)
+find_package(CUDA REQUIRED)
+find_package(OpenMP REQUIRED)
+
+# Include directories
+include_directories(${OPENCV_INCLUDE_DIRS})
+include_directories(${CUDA_INCLUDE_DIRS})
+
+# Set CUDA flags
+set(CUDA_NVCC_FLAGS ${CUDA_NVCC_FLAGS} -O3 --use_fast_math)
+
+# Add source files
+set(SOURCES
+    rgdic.cpp
+    rgdic_icgn_gpu.cpp
+    main.cpp
+)
+
+set(CUDA_SOURCES
+    rgdic_cuda.cu
+)
+
+# Create executable
+cuda_add_executable(rgdic_gpu ${SOURCES} ${CUDA_SOURCES})
+
+# Link libraries
+target_link_libraries(rgdic_gpu ${OpenCV_LIBS} ${CUDA_LIBRARIES} OpenMP::OpenMP_CXX)
+
+# Enable OpenMP
+target_compile_options(rgdic_gpu PRIVATE ${OpenMP_CXX_FLAGS})
+
+# Add CUDA compute capability flags
+if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_LESS "11.0")
+    set_property(TARGET rgdic_gpu PROPERTY CUDA_ARCHITECTURES 35 50 60 70 75)
+else()
+    set_property(TARGET rgdic_gpu PROPERTY CUDA_ARCHITECTURES 35 50 60 70 75 80)
+endif()
+
+# Set output directory
+set_target_properties(rgdic_gpu PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
+# Install target
+install(TARGETS rgdic_gpu
+    RUNTIME DESTINATION bin
+)
+
+# Copy example images if available
+file(GLOB EXAMPLE_IMAGES "test_images/*.png")
+if(EXAMPLE_IMAGES)
+    install(FILES ${EXAMPLE_IMAGES} DESTINATION bin/test_images)
+endif()

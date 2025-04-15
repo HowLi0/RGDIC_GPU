@@ -1,6 +1,17 @@
 {
     "configurations": [
         {
+            "name": "CUDA C++: Attach",
+            "type": "cuda-gdb",
+            "request": "attach"
+        },
+        {
+            "name": "CUDA C++: Launch",
+            "type": "cuda-gdb",
+            "request": "launch",
+            "program": ""
+        },
+        {
             "name": "C/C++: g++.exe 构建和调试活动文件",
             "type": "cppdbg",
             "request": "launch",

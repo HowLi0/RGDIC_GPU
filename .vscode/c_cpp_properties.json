@@ -4,14 +4,15 @@
             "name": "Win32",
             "includePath": [
                 "${workspaceFolder}/**",
-                "D:/Opencv-4.1.0.0/OpenCV-MinGW-Build-OpenCV-4.1.0-x64/include"
+                "D:/Opencv-4.1.0.0/OpenCV-MinGW-Build-OpenCV-4.1.0-x64/include",
+                "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8/include"
             ],
             "defines": [
                 "_DEBUG",
                 "UNICODE",
                 "_UNICODE"
             ],
-            "compilerPath": "D:\\QT\\QTcreator\\Tools\\mingw1310_64\\bin\\g++.exe",
+            "compilerPath": "D:/QT/QTcreator/Tools/mingw1310_64/bin/g++.exe",
             "intelliSenseMode": "windows-gcc-x64",
             "cStandard": "c17",
             "cppStandard": "c++17"

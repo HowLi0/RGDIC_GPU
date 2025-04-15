@@ -1,22 +1,59 @@
-#include "RGDIC.h"
+#include "rgdic.h"
 #include <iostream>
 #include <functional>
+#include <atomic>
+#include <chrono>
 
+// Constructor with computation mode parameter
 RGDIC::RGDIC(int subsetRadius, double convergenceThreshold, int maxIterations,
-           double ccThreshold, double deltaDispThreshold, ShapeFunctionOrder order)
+           double ccThreshold, double deltaDispThreshold, ShapeFunctionOrder order,
+           ComputationMode mode, int numThreads)
     : m_subsetRadius(subsetRadius),
       m_convergenceThreshold(convergenceThreshold),
       m_maxIterations(maxIterations),
       m_ccThreshold(ccThreshold),
       m_deltaDispThreshold(deltaDispThreshold),
-      m_order(order)
+      m_order(order),
+      m_mode(mode)
 {
     // Set number of parameters based on shape function order
     m_numParams = (order == FIRST_ORDER) ? 6 : 12;
+    
+    // Set number of threads for parallel processing
+    if (numThreads <= 0) {
+        m_numThreads = std::thread::hardware_concurrency();
+    } else {
+        m_numThreads = numThreads;
+    }
+    
+    // Initialize OpenMP threads
+    omp_set_num_threads(m_numThreads);
+    
+    // Initialize CUDA if using GPU mode
+    if (mode == GPU_CUDA || mode == HYBRID) {
+        RGDIC_CUDA::initializeGPU();
+        RGDIC_CUDA::printGPUInfo();
+        
+        if (!RGDIC_CUDA::checkGPUCompatibility()) {
+            std::cerr << "Warning: GPU compatibility issues detected. Falling back to CPU mode." << std::endl;
+            m_mode = CPU_MULTI_THREAD;
+        }
+    }
+    
+    std::cout << "RGDIC initialized with " << m_numThreads << " threads and computation mode: ";
+    switch (m_mode) {
+        case CPU_SINGLE_THREAD: std::cout << "CPU single thread"; break;
+        case CPU_MULTI_THREAD: std::cout << "CPU multi-threaded"; break;
+        case GPU_CUDA: std::cout << "GPU CUDA"; break;
+        case HYBRID: std::cout << "Hybrid CPU/GPU"; break;
+    }
+    std::cout << std::endl;
 }
 
 RGDIC::DisplacementResult RGDIC::compute(const cv::Mat& refImage, const cv::Mat& defImage, const cv::Mat& roi)
 {
+    auto startTime = std::chrono::high_resolution_clock::now();
+    
     // Initialize results
     DisplacementResult result;
     result.u = cv::Mat::zeros(roi.size(), CV_64F);
@@ -30,93 +67,148 @@ RGDIC::DisplacementResult RGDIC::compute(const cv::Mat& refImage, const cv::Mat&
     // Find seed point
     cv::Point seedPoint = findSeedPoint(roi, sda);
     
-    // Create the ICGN optimizer
-    ICGNOptimizer optimizer(refImage, defImage, m_subsetRadius, m_order, 
-                          m_convergenceThreshold, m_maxIterations);
+    std::cout << "Starting RGDIC computation with seed point at (" << seedPoint.x << ", " << seedPoint.y << ")" << std::endl;
     
-    // Initialize warp parameters matrix
-    cv::Mat warpParams = cv::Mat::zeros(m_numParams, 1, CV_64F);
-    
-    // Compute initial ZNCC
-    double initialZNCC = 0.0;
-    
-    // Try to compute initial guess for seed point
-    if (!optimizer.initialGuess(seedPoint, warpParams, initialZNCC)) {
-        std::cerr << "Failed to find initial guess for seed point." << std::endl;
-        return result;
+    // Choose appropriate implementation based on computation mode
+    switch (m_mode) {
+        case CPU_SINGLE_THREAD:
+            // Original single-threaded implementation
+            {
+                // Create the ICGN optimizer
+                ICGNOptimizer optimizer(refImage, defImage, m_subsetRadius, m_order, 
+                                      m_convergenceThreshold, m_maxIterations, CPU_SINGLE_THREAD);
+                
+                // Initialize warp parameters matrix
+                cv::Mat warpParams = cv::Mat::zeros(m_numParams, 1, CV_64F);
+                
+                // Compute initial ZNCC
+                double initialZNCC = 0.0;
+                
+                // Process seed point
+                if (!optimizer.initialGuess(seedPoint, warpParams, initialZNCC) || 
+                    !optimizer.optimize(seedPoint, warpParams, initialZNCC) ||
+                    initialZNCC > m_ccThreshold) {
+                    std::cerr << "Failed to process seed point." << std::endl;
+                    return result;
+                }
+                
+                // Save seed point results
+                result.u.at<double>(seedPoint) = warpParams.at<double>(0);
+                result.v.at<double>(seedPoint) = warpParams.at<double>(1);
+                result.cc.at<double>(seedPoint) = initialZNCC;
+                result.validMask.at<uchar>(seedPoint) = 1;
+                
+                // Define comparator for priority queue
+                auto comparator = [](const std::pair<cv::Point, double>& a, const std::pair<cv::Point, double>& b) {
+                    return a.second > b.second;
+                };
+                
+                // Create priority queue for reliability-guided search
+                PriorityQueue queue(comparator);
+                
+                // Initialize queue with seed point
+                queue.push(std::make_pair(seedPoint, initialZNCC));
+                
+                // Create analyzed points tracker
+                cv::Mat analyzedPoints = cv::Mat::zeros(roi.size(), CV_8U);
+                analyzedPoints.at<uchar>(seedPoint) = 1;
+                
+                // Define 4-connected neighbors
+                const cv::Point neighbors[] = {
+                    {0, 1}, {1, 0}, {0, -1}, {-1, 0}
+                };
+                
+                // Reliability-guided search
+                while (!queue.empty()) {
+                    // Get point with highest reliability (lowest ZNCC value)
+                    auto current = queue.top();
+                    queue.pop();
+                    
+                    cv::Point currentPoint = current.first;
+                    
+                    // Check all neighbors
+                    for (int i = 0; i < 4; i++) {
+                        cv::Point neighborPoint = currentPoint + neighbors[i];
+                        
+                        // Check if neighbor is within image bounds and ROI
+                        if (neighborPoint.x >= 0 && neighborPoint.x < roi.cols &&
+                            neighborPoint.y >= 0 && neighborPoint.y < roi.rows &&
+                            roi.at<uchar>(neighborPoint) > 0 &&
+                            analyzedPoints.at<uchar>(neighborPoint) == 0) {
+                            
+                            // Mark as analyzed
+                            analyzedPoints.at<uchar>(neighborPoint) = 1;
+                            
+                            // Try to analyze this point
+                            analyzePoint(neighborPoint, optimizer, roi, result, queue, analyzedPoints);
+                        }
+                    }
+                }
+            }
+            break;
+            
+        case CPU_MULTI_THREAD:
+            // Multi-threaded CPU implementation
+            reliabilityGuidedSearch(refImage, defImage, roi, seedPoint, result);
+            break;
+            
+
+    case GPU_CUDA:
+    case HYBRID:
+        // GPU implementation
+        reliabilityGuidedSearchGPU(refImage, defImage, roi, seedPoint, result);
+        break;
     }
-    
-    // Optimize seed point
-    if (!optimizer.optimize(seedPoint, warpParams, initialZNCC)) {
-        std::cerr << "Failed to optimize seed point." << std::endl;
-        return result;
-    }
-    
-    // Check if seed point has good correlation
-    if (initialZNCC > m_ccThreshold) {
-        std::cerr << "Seed point has poor correlation: " << initialZNCC << std::endl;
-        return result;
-    }
-    
-    // Save seed point results
-    result.u.at<double>(seedPoint) = warpParams.at<double>(0);
-    result.v.at<double>(seedPoint) = warpParams.at<double>(1);
-    result.cc.at<double>(seedPoint) = initialZNCC;
-    result.validMask.at<uchar>(seedPoint) = 1;
-    
-    // Define comparator for priority queue
-    auto comparator = [](const std::pair<cv::Point, double>& a, const std::pair<cv::Point, double>& b) {
-        return a.second > b.second;
-    };
-    
-    // Create priority queue for reliability-guided search
-    PriorityQueue queue(comparator);
-    
-    // Initialize queue with seed point
-    queue.push(std::make_pair(seedPoint, initialZNCC));
-    
-    // Create analyzed points tracker
-    cv::Mat analyzedPoints = cv::Mat::zeros(roi.size(), CV_8U);
-    analyzedPoints.at<uchar>(seedPoint) = 1;
-    
+
+    // Post-process to remove outliers
+    // Create a copy of valid mask
+    cv::Mat validMaskCopy = result.validMask.clone();
+
     // Define 4-connected neighbors
     const cv::Point neighbors[] = {
-        {0, 1}, {1, 0}, {0, -1}, {-1, 0}
+    {0, 1}, {1, 0}, {0, -1}, {-1, 0}
     };
-    
-    // Reliability-guided search
-    while (!queue.empty()) {
-        // Get point with highest reliability (lowest ZNCC value)
-        auto current = queue.top();
-        queue.pop();
-        
-        cv::Point currentPoint = current.first;
-        
-        // Check all neighbors
-        for (int i = 0; i < 4; i++) {
-            cv::Point neighborPoint = currentPoint + neighbors[i];
-            
-            // Check if neighbor is within image bounds and ROI
-            if (neighborPoint.x >= 0 && neighborPoint.x < roi.cols &&
-                neighborPoint.y >= 0 && neighborPoint.y < roi.rows &&
-                roi.at<uchar>(neighborPoint) > 0 &&
-                analyzedPoints.at<uchar>(neighborPoint) == 0) {
+
+    // Parallel outlier removal for multi-threaded modes
+    if (m_mode != CPU_SINGLE_THREAD) {
+    #pragma omp parallel for collapse(2)
+    for (int y = 0; y < result.validMask.rows; y++) {
+        for (int x = 0; x < result.validMask.cols; x++) {
+            if (result.validMask.at<uchar>(y, x)) {
+                // Check displacement jumps with valid neighbors
+                bool isOutlier = false;
                 
-                // Mark as analyzed
-                analyzedPoints.at<uchar>(neighborPoint) = 1;
+                for (int i = 0; i < 4; i++) {
+                    cv::Point neighborPoint(x + neighbors[i].x, y + neighbors[i].y);
+                    
+                    if (neighborPoint.x >= 0 && neighborPoint.x < roi.cols &&
+                        neighborPoint.y >= 0 && neighborPoint.y < roi.rows &&
+                        result.validMask.at<uchar>(neighborPoint)) {
+                        
+                        // Calculate displacement jump
+                        double du = result.u.at<double>(y, x) - result.u.at<double>(neighborPoint);
+                        double dv = result.v.at<double>(y, x) - result.v.at<double>(neighborPoint);
+                        double dispJump = std::sqrt(du*du + dv*dv);
+                        
+                        // Mark as outlier if displacement jump is too large
+                        if (dispJump > m_deltaDispThreshold) {
+                            isOutlier = true;
+                            break;
+                        }
+                    }
+                }
                 
-                // Try to analyze this point
-                if (analyzePoint(neighborPoint, optimizer, roi, result, queue, analyzedPoints)) {
-                    // Point successfully analyzed and added to queue
+                if (isOutlier) {
+                    #pragma omp critical
+                    {
+                        validMaskCopy.at<uchar>(y, x) = 0;
+                    }
                 }
             }
         }
     }
-    
-    // Post-process to remove outliers
-    // Create a copy of valid mask
-    cv::Mat validMaskCopy = result.validMask.clone();
-    
+    } else {
+    // Single-threaded outlier removal
     for (int y = 0; y < result.validMask.rows; y++) {
         for (int x = 0; x < result.validMask.cols; x++) {
             if (result.validMask.at<uchar>(y, x)) {
@@ -149,40 +241,451 @@ RGDIC::DisplacementResult RGDIC::compute(const cv::Mat& refImage, const cv::Mat&
             }
         }
     }
-    
+    }
+
     // Update result with filtered mask
     result.validMask = validMaskCopy;
-    
+
+    auto endTime = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
+
+    // Count valid points
+    int validPoints = cv::countNonZero(result.validMask);
+    int totalROIPoints = cv::countNonZero(roi);
+
+    std::cout << "RGDIC computation completed in " << duration.count() / 1000.0 << " seconds." << std::endl;
+    std::cout << "Valid points: " << validPoints << " out of " << totalROIPoints 
+        << " (" << 100.0 * validPoints / totalROIPoints << "%)" << std::endl;
+
     return result;
-}
+    }
 
-cv::Mat RGDIC::calculateSDA(const cv::Mat& roi) {
+    // Multi-threaded implementation of reliability-guided search
+    void RGDIC::reliabilityGuidedSearch(const cv::Mat& refImage, const cv::Mat& defImage, 
+                            const cv::Mat& roi, cv::Point seedPoint, 
+                            DisplacementResult& result)
+    {
+    // Create the ICGN optimizer
+    ICGNOptimizer optimizer(refImage, defImage, m_subsetRadius, m_order, 
+                    m_convergenceThreshold, m_maxIterations, CPU_MULTI_THREAD);
+
+    // Initialize warp parameters matrix for seed point
+    cv::Mat warpParams = cv::Mat::zeros(m_numParams, 1, CV_64F);
+    double initialZNCC = 0.0;
+
+    // Process seed point
+    if (!optimizer.initialGuess(seedPoint, warpParams, initialZNCC) || 
+    !optimizer.optimize(seedPoint, warpParams, initialZNCC) ||
+    initialZNCC > m_ccThreshold) {
+    std::cerr << "Failed to process seed point." << std::endl;
+    return;
+    }
+
+    // Save seed point results
+    result.u.at<double>(seedPoint) = warpParams.at<double>(0);
+    result.v.at<double>(seedPoint) = warpParams.at<double>(1);
+    result.cc.at<double>(seedPoint) = initialZNCC;
+    result.validMask.at<uchar>(seedPoint) = 1;
+
+    // Define comparator for priority queue
+    auto comparator = [](const std::pair<cv::Point, double>& a, const std::pair<cv::Point, double>& b) {
+    return a.second > b.second;
+    };
+
+    // Create thread-safe priority queue
+    PriorityQueue queue(comparator);
+    queue.push(std::make_pair(seedPoint, initialZNCC));
+
+    // Create analyzed points tracker
+    cv::Mat analyzedPoints = cv::Mat::zeros(roi.size(), CV_8U);
+    analyzedPoints.at<uchar>(seedPoint) = 1;
+
+    // Define 4-connected neighbors
+    const cv::Point neighbors[] = {
+    {0, 1}, {1, 0}, {0, -1}, {-1, 0}
+    };
+
+    // Define a worker function for threads
+    auto workerFunction = [&](int threadId) {
+    // Create local optimizer for this thread
+    ICGNOptimizer localOptimizer(refImage, defImage, m_subsetRadius, m_order, 
+                                m_convergenceThreshold, m_maxIterations, CPU_MULTI_THREAD);
+
+    while (true) {
+        // Get next point from queue
+        cv::Point currentPoint;
+        double currentZNCC = 0.0;
+        
+        {
+            std::lock_guard<std::mutex> lock(m_queueMutex);
+            if (queue.empty()) {
+                break;  // No more points to process
+            }
+            
+            auto current = queue.top();
+            queue.pop();
+            currentPoint = current.first;
+            currentZNCC = current.second;
+        }
+        
+        // Process neighbors of current point
+        for (int i = 0; i < 4; i++) {
+            cv::Point neighborPoint = currentPoint + neighbors[i];
+            
+            // Check if neighbor is within bounds and not yet analyzed
+            bool shouldProcess = false;
+            {
+                std::lock_guard<std::mutex> lock(m_resultMutex);
+                if (neighborPoint.x >= 0 && neighborPoint.x < roi.cols &&
+                    neighborPoint.y >= 0 && neighborPoint.y < roi.rows &&
+                    roi.at<uchar>(neighborPoint) > 0 &&
+                    analyzedPoints.at<uchar>(neighborPoint) == 0) {
+                    
+                    // Mark as analyzed
+                    analyzedPoints.at<uchar>(neighborPoint) = 1;
+                    shouldProcess = true;
+                }
+            }
+            
+            if (shouldProcess) {
+                // Local queue for this thread
+                PriorityQueue localQueue(comparator);
+                
+                // Try to analyze this point
+                bool success = analyzePoint(neighborPoint, localOptimizer, roi, result, 
+                                        localQueue, analyzedPoints);
+                
+                // If successful, add new points to the global queue
+                if (success && !localQueue.empty()) {
+                    std::lock_guard<std::mutex> lock(m_queueMutex);
+                    while (!localQueue.empty()) {
+                        queue.push(localQueue.top());
+                        localQueue.pop();
+                    }
+                }
+            }
+        }
+    }
+    };
+
+    // Create and start worker threads
+    std::vector<std::thread> threads;
+    for (int i = 0; i < m_numThreads; i++) {
+    threads.push_back(std::thread(workerFunction, i));
+    }
+
+    // Wait for all threads to complete
+    for (auto& thread : threads) {
+    thread.join();
+    }
+    }
+
+    // GPU implementation of reliability-guided search
+    void RGDIC::reliabilityGuidedSearchGPU(const cv::Mat& refImage, const cv::Mat& defImage, 
+                                const cv::Mat& roi, cv::Point seedPoint, 
+                                DisplacementResult& result)
+    {
+    // Create the GPU-enabled optimizer
+    ICGNOptimizer optimizer(refImage, defImage, m_subsetRadius, m_order, 
+                    m_convergenceThreshold, m_maxIterations, GPU_CUDA);
+
+    // Initialize warp parameters matrix for seed point
+    cv::Mat warpParams = cv::Mat::zeros(m_numParams, 1, CV_64F);
+    double initialZNCC = 0.0;
+
+    // Process seed point using GPU
+    if (!optimizer.initialGuessGPU(seedPoint, warpParams, initialZNCC) || 
+    !optimizer.optimizeGPU(seedPoint, warpParams, initialZNCC) ||
+    initialZNCC > m_ccThreshold) {
+    std::cerr << "Failed to process seed point on GPU." << std::endl;
+    return;
+    }
+
+    // Save seed point results
+    result.u.at<double>(seedPoint) = warpParams.at<double>(0);
+    result.v.at<double>(seedPoint) = warpParams.at<double>(1);
+    result.cc.at<double>(seedPoint) = initialZNCC;
+    result.validMask.at<uchar>(seedPoint) = 1;
+
+    // Define comparator for priority queue
+    auto comparator = [](const std::pair<cv::Point, double>& a, const std::pair<cv::Point, double>& b) {
+    return a.second > b.second;
+    };
+
+    // Create priority queue for reliability-guided search
+    PriorityQueue queue(comparator);
+    queue.push(std::make_pair(seedPoint, initialZNCC));
+
+    // Create analyzed points tracker
+    cv::Mat analyzedPoints = cv::Mat::zeros(roi.size(), CV_8U);
+    analyzedPoints.at<uchar>(seedPoint) = 1;
+
+    // Define 4-connected neighbors
+    const cv::Point neighbors[] = {
+    {0, 1}, {1, 0}, {0, -1}, {-1, 0}
+    };
+
+    // For GPU mode, we use a hybrid approach:
+    // 1. CPU handles coordination of points and queue management
+    // 2. GPU handles optimization computations for batches of points
+
+    // Define a batch size for GPU processing
+    const int batchSize = 64; // Adjust based on GPU capabilities
+
+    // Create a pool of worker threads for GPU optimization tasks
+    std::vector<std::thread> workerThreads;
+    std::atomic<bool> stopWorkers(false);
+
+    // Shared data structures for worker threads
+    std::mutex batchMutex;
+    std::condition_variable batchCondition;
+    std::vector<cv::Point> pointBatch;
+    std::vector<bool> resultFlags(batchSize, false);
+    std::vector<cv::Mat> resultWarpParams(batchSize);
+    std::vector<double> resultZncc(batchSize, 0.0);
+    std::atomic<int> readyCount(0);
+    std::atomic<int> processedCount(0);
+    bool batchReady = false;
+
+    // Initialize worker threads
+    for (int t = 0; t < m_numThreads; ++t) {
+    workerThreads.push_back(std::thread([&, t]() {
+        // Create a local GPU optimizer for this thread
+        ICGNOptimizer localOptimizer(refImage, defImage, m_subsetRadius, m_order,
+                                    m_convergenceThreshold, m_maxIterations, GPU_CUDA);
+        
+        while (!stopWorkers) {
+            // Wait for batch to be ready or for stop signal
+            std::unique_lock<std::mutex> lock(batchMutex);
+            batchCondition.wait(lock, [&]() { return batchReady || stopWorkers; });
+            
+            if (stopWorkers) break;
+            
+            // Get assigned range of points to process
+            int startIdx = t * (pointBatch.size() / m_numThreads);
+            int endIdx = (t == m_numThreads - 1) ? pointBatch.size() : (t + 1) * (pointBatch.size() / m_numThreads);
+            
+            // Process assigned points
+            for (int i = startIdx; i < endIdx; ++i) {
+                if (i >= pointBatch.size()) break;
+                
+                const cv::Point& point = pointBatch[i];
+                cv::Mat localWarpParams = cv::Mat::zeros(m_numParams, 1, CV_64F);
+                double localZncc = 0.0;
+                
+                // Find best neighbor for initial guess
+                std::vector<cv::Point> validNeighbors;
+                for (int j = 0; j < 4; j++) {
+                    cv::Point checkPoint = point + neighbors[j];
+                    if (checkPoint.x >= 0 && checkPoint.x < roi.cols &&
+                        checkPoint.y >= 0 && checkPoint.y < roi.rows &&
+                        result.validMask.at<uchar>(checkPoint) > 0) {
+                        validNeighbors.push_back(checkPoint);
+                    }
+                }
+                
+                bool success = false;
+                
+                if (!validNeighbors.empty()) {
+                    // Find neighbor with best correlation
+                    cv::Point bestNeighbor = validNeighbors[0];
+                    double bestCC = result.cc.at<double>(bestNeighbor);
+                    
+                    for (size_t j = 1; j < validNeighbors.size(); j++) {
+                        double cc = result.cc.at<double>(validNeighbors[j]);
+                        if (cc < bestCC) {
+                            bestCC = cc;
+                            bestNeighbor = validNeighbors[j];
+                        }
+                    }
+                    
+                    // Use warp parameters from best neighbor as initial guess
+                    localWarpParams.at<double>(0) = result.u.at<double>(bestNeighbor);
+                    localWarpParams.at<double>(1) = result.v.at<double>(bestNeighbor);
+                    
+                    // Run GPU optimization
+                    success = localOptimizer.optimizeGPU(point, localWarpParams, localZncc);
+                    success = success && (localZncc < m_ccThreshold);
+                    
+                    if (success) {
+                        // Check for displacement jump
+                        double du = localWarpParams.at<double>(0) - result.u.at<double>(bestNeighbor);
+                        double dv = localWarpParams.at<double>(1) - result.v.at<double>(bestNeighbor);
+                        double dispJump = std::sqrt(du*du + dv*dv);
+                        
+                        success = (dispJump <= m_deltaDispThreshold);
+                    }
+                }
+                
+                // Store results
+                resultFlags[i] = success;
+                if (success) {
+                    resultWarpParams[i] = localWarpParams.clone();
+                    resultZncc[i] = localZncc;
+                }
+                
+                // Increment processed count
+                processedCount++;
+            }
+            
+            // Signal that this thread is done with its batch
+            readyCount++;
+            
+            // Last thread to finish clears the batch ready flag
+            if (readyCount == m_numThreads) {
+                batchReady = false;
+                lock.unlock();
+                batchCondition.notify_one(); // Notify main thread
+            }
+        }
+    }));
+    }
+
+    // Main processing loop
+    while (!queue.empty()) {
+    // Prepare batch of points from the queue
+    pointBatch.clear();
+
+    // Critical section: extract points from the queue
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        
+        for (int i = 0; i < batchSize && !queue.empty(); ++i) {
+            auto current = queue.top();
+            queue.pop();
+            cv::Point currentPoint = current.first;
+            
+            // For each point in batch, collect its unanalyzed neighbors
+            for (int j = 0; j < 4; j++) {
+                cv::Point neighborPoint = currentPoint + neighbors[j];
+                
+                // Check if within bounds and not yet analyzed
+                if (neighborPoint.x >= 0 && neighborPoint.x < roi.cols &&
+                    neighborPoint.y >= 0 && neighborPoint.y < roi.rows &&
+                    roi.at<uchar>(neighborPoint) > 0 &&
+                    analyzedPoints.at<uchar>(neighborPoint) == 0) {
+                    
+                    // Mark as analyzed to avoid duplicates
+                    analyzedPoints.at<uchar>(neighborPoint) = 1;
+                    
+                    // Add to the batch
+                    pointBatch.push_back(neighborPoint);
+                }
+            }
+        }
+    }
+
+    // If no points to process, we're done
+    if (pointBatch.empty()) {
+        break;
+    }
+
+    // Resize result vectors to match batch size
+    resultFlags.resize(pointBatch.size(), false);
+    resultWarpParams.resize(pointBatch.size());
+    resultZncc.resize(pointBatch.size(), 0.0);
+
+    // Reset counters
+    readyCount = 0;
+    processedCount = 0;
+
+    // Set batch ready flag and notify worker threads
+    {
+        std::unique_lock<std::mutex> lock(batchMutex);
+        batchReady = true;
+        lock.unlock();
+        batchCondition.notify_all();
+        
+        // Wait for all threads to finish processing
+        lock.lock();
+        batchCondition.wait(lock, [&]() { return !batchReady; });
+    }
+
+    // Process results and update global data structures
+    for (size_t i = 0; i < pointBatch.size(); ++i) {
+        if (resultFlags[i]) {
+            const cv::Point& point = pointBatch[i];
+            
+            // Update results
+            {
+                std::lock_guard<std::mutex> lock(m_resultMutex);
+                result.u.at<double>(point) = resultWarpParams[i].at<double>(0);
+                result.v.at<double>(point) = resultWarpParams[i].at<double>(1);
+                result.cc.at<double>(point) = resultZncc[i];
+                result.validMask.at<uchar>(point) = 1;
+            }
+            
+            // Add to queue for further propagation
+            {
+                std::lock_guard<std::mutex> lock(m_queueMutex);
+                queue.push(std::make_pair(point, resultZncc[i]));
+            }
+        }
+    }
+    }
+
+    // Stop worker threads
+    {
+    std::lock_guard<std::mutex> lock(batchMutex);
+    stopWorkers = true;
+    }
+    batchCondition.notify_all();
+
+    // Join worker threads
+    for (auto& thread : workerThreads) {
+    thread.join();
+    }
+    }
+
+    cv::Mat RGDIC::calculateSDA(const cv::Mat& roi) {
     cv::Mat dist;
-    cv::distanceTransform(roi, dist, cv::DIST_L2, cv::DIST_MASK_PRECISE);
-    return dist;
-}
 
-cv::Point RGDIC::findSeedPoint(const cv::Mat& roi, const cv::Mat& sda) {
+    // Use GPU for distance transform if available
+    if (m_mode == GPU_CUDA || m_mode == HYBRID) {
+    // For GPU mode, we'll use CUDA kernels directly
+    // This is a simplified implementation - in practice, you'd implement a CUDA kernel for the distance transform
+
+    // Fall back to CPU implementation for now
+    cv::distanceTransform(roi, dist, cv::DIST_L2, cv::DIST_MASK_PRECISE);
+    } else {
+    // For multi-threaded CPU mode, use parallel processing if available
+    if (m_mode == CPU_MULTI_THREAD) {
+        // Unfortunately, distanceTransform doesn't support parallel execution directly,
+        // so we'll use the standard implementation
+        cv::distanceTransform(roi, dist, cv::DIST_L2, cv::DIST_MASK_PRECISE);
+    } else {
+        // Single-threaded CPU mode
+        cv::distanceTransform(roi, dist, cv::DIST_L2, cv::DIST_MASK_PRECISE);
+    }
+    }
+
+    return dist;
+    }
+
+    cv::Point RGDIC::findSeedPoint(const cv::Mat& roi, const cv::Mat& sda) {
     cv::Point maxLoc;
     double maxVal;
-    
+
     // Find point with maximum SDA value (furthest from boundaries)
     cv::minMaxLoc(sda, nullptr, &maxVal, nullptr, &maxLoc, roi);
-    
-    return maxLoc;
-}
 
-bool RGDIC::analyzePoint(const cv::Point& point, ICGNOptimizer& optimizer, 
-    const cv::Mat& roi, DisplacementResult& result, 
-    PriorityQueue& queue, cv::Mat& analyzedPoints)
-{
+    return maxLoc;
+    }
+
+    bool RGDIC::analyzePoint(const cv::Point& point, ICGNOptimizer& optimizer, 
+                const cv::Mat& roi, DisplacementResult& result, 
+                PriorityQueue& queue, cv::Mat& analyzedPoints)
+    {
     // Get neighboring points that have already been analyzed successfully
     std::vector<cv::Point> validNeighbors;
-    
+
     const cv::Point neighbors[] = {
-        {0, 1}, {1, 0}, {0, -1}, {-1, 0}
+    {0, 1}, {1, 0}, {0, -1}, {-1, 0}
     };
-    
+
+    // Thread-safe access to valid neighbors
+    {
+    std::lock_guard<std::mutex> lock(m_resultMutex);
     for (int i = 0; i < 4; i++) {
         cv::Point neighborPoint = point + neighbors[i];
         
@@ -193,15 +696,20 @@ bool RGDIC::analyzePoint(const cv::Point& point, ICGNOptimizer& optimizer,
             validNeighbors.push_back(neighborPoint);
         }
     }
-    
-    if (validNeighbors.empty()) {
-        return false; // No valid neighbors to use as initial guess
     }
-    
+
+    if (validNeighbors.empty()) {
+    return false; // No valid neighbors to use as initial guess
+    }
+
     // Find neighbor with best correlation coefficient
     cv::Point bestNeighbor = validNeighbors[0];
-    double bestCC = result.cc.at<double>(bestNeighbor);
-    
+    double bestCC = 0.0;
+
+    {
+    std::lock_guard<std::mutex> lock(m_resultMutex);
+    bestCC = result.cc.at<double>(bestNeighbor);
+
     for (size_t i = 1; i < validNeighbors.size(); i++) {
         double cc = result.cc.at<double>(validNeighbors[i]);
         if (cc < bestCC) { // Lower ZNCC value = better correlation
@@ -209,108 +717,178 @@ bool RGDIC::analyzePoint(const cv::Point& point, ICGNOptimizer& optimizer,
             bestNeighbor = validNeighbors[i];
         }
     }
-    
+    }
+
     // Use warp parameters from best neighbor as initial guess
     cv::Mat warpParams = cv::Mat::zeros(m_numParams, 1, CV_64F);
+
+    {
+    std::lock_guard<std::mutex> lock(m_resultMutex);
     warpParams.at<double>(0) = result.u.at<double>(bestNeighbor);
     warpParams.at<double>(1) = result.v.at<double>(bestNeighbor);
-    
-    // For higher order parameters, we'd need to store them in the result
-    // For simplicity, we're only storing and using u and v here
-    
+    }
+
     // Run ICGN optimization
     double zncc;
-    bool success = optimizer.optimize(point, warpParams, zncc);
-    
+    bool success = false;
+
+    if (m_mode == GPU_CUDA || m_mode == HYBRID) {
+    success = optimizer.optimizeGPU(point, warpParams, zncc);
+    } else {
+    success = optimizer.optimize(point, warpParams, zncc);
+    }
+
     if (success && zncc < m_ccThreshold) { // Lower ZNCC value = better correlation
-        // Check for displacement jump
-        double du = warpParams.at<double>(0) - result.u.at<double>(bestNeighbor);
-        double dv = warpParams.at<double>(1) - result.v.at<double>(bestNeighbor);
-        double dispJump = std::sqrt(du*du + dv*dv);
-        
-        if (dispJump <= m_deltaDispThreshold) {
-            // Store results
+    // Check for displacement jump
+    double du = 0.0;
+    double dv = 0.0;
+
+    {
+        std::lock_guard<std::mutex> lock(m_resultMutex);
+        du = warpParams.at<double>(0) - result.u.at<double>(bestNeighbor);
+        dv = warpParams.at<double>(1) - result.v.at<double>(bestNeighbor);
+    }
+
+    double dispJump = std::sqrt(du*du + dv*dv);
+
+    if (dispJump <= m_deltaDispThreshold) {
+        // Store results
+        {
+            std::lock_guard<std::mutex> lock(m_resultMutex);
             result.u.at<double>(point) = warpParams.at<double>(0);
             result.v.at<double>(point) = warpParams.at<double>(1);
             result.cc.at<double>(point) = zncc;
             result.validMask.at<uchar>(point) = 1;
-            
-            // Add to queue for further propagation
-            queue.push(std::make_pair(point, zncc));
-            return true;
+        }
+        
+        // Add to queue for further propagation
+        queue.push(std::make_pair(point, zncc));
+        return true;
+    }
+    }
+
+    return false;
+    }
+
+    // Divide ROI into segments for parallel processing
+    std::vector<RGDIC::PointSegment> RGDIC::divideROIIntoSegments(const cv::Mat& roi, int numSegments) {
+    // Count total ROI points
+    int totalPoints = cv::countNonZero(roi);
+    int pointsPerSegment = totalPoints / numSegments;
+
+    std::vector<PointSegment> segments;
+
+    // Collect all ROI points
+    std::vector<cv::Point> allPoints;
+    for (int y = 0; y < roi.rows; y++) {
+    for (int x = 0; x < roi.cols; x++) {
+        if (roi.at<uchar>(y, x) > 0) {
+            allPoints.push_back(cv::Point(x, y));
         }
     }
-    
-    return false;
-}
+    }
 
-void RGDIC::displayResults(const cv::Mat& refImage, const DisplacementResult& result, 
-                         const cv::Mat& trueDispX, const cv::Mat& trueDispY) {
+    // Divide points into segments
+    for (int i = 0; i < numSegments; i++) {
+    int startIdx = i * pointsPerSegment;
+    int endIdx = (i == numSegments - 1) ? allPoints.size() : (i + 1) * pointsPerSegment;
+
+    if (startIdx >= allPoints.size()) {
+        break;
+    }
+
+    PointSegment segment;
+    segment.points.assign(allPoints.begin() + startIdx, allPoints.begin() + endIdx);
+
+    // Calculate bounding rectangle
+    int minX = INT_MAX, minY = INT_MAX;
+    int maxX = 0, maxY = 0;
+
+    for (const auto& pt : segment.points) {
+        minX = std::min(minX, pt.x);
+        minY = std::min(minY, pt.y);
+        maxX = std::max(maxX, pt.x);
+        maxY = std::max(maxY, pt.y);
+    }
+
+    segment.bounds = cv::Rect(minX, minY, maxX - minX + 1, maxY - minY + 1);
+    segments.push_back(segment);
+    }
+
+    return segments;
+    }
+
+    void RGDIC::displayResults(const cv::Mat& refImage, const DisplacementResult& result, 
+                    const cv::Mat& trueDispX, const cv::Mat& trueDispY) {
     // Create visualizations for displacement fields
     cv::Mat uViz, vViz;
-    
+
     // Find min/max values for normalization
     double minU, maxU, minV, maxV;
     cv::minMaxLoc(result.u, &minU, &maxU, nullptr, nullptr, result.validMask);
     cv::minMaxLoc(result.v, &minV, &maxV, nullptr, nullptr, result.validMask);
-    
+
+    std::cout << "Displacement range: U [" << minU << ", " << maxU << "] V [" << minV << ", " << maxV << "]" << std::endl;
+
     // Normalize displacement fields for visualization
     cv::Mat uNorm, vNorm;
     cv::normalize(result.u, uNorm, 0, 255, cv::NORM_MINMAX, CV_8U, result.validMask);
     cv::normalize(result.v, vNorm, 0, 255, cv::NORM_MINMAX, CV_8U, result.validMask);
-    
+
     // Apply color map
     cv::Mat uColor, vColor;
     cv::applyColorMap(uNorm, uColor, cv::COLORMAP_JET);
     cv::applyColorMap(vNorm, vColor, cv::COLORMAP_JET);
-    
+
     // Apply valid mask
     cv::Mat validMask3Ch;
     cv::cvtColor(result.validMask, validMask3Ch, cv::COLOR_GRAY2BGR);
     uColor = uColor.mul(validMask3Ch, 1.0/255.0);
     vColor = vColor.mul(validMask3Ch, 1.0/255.0);
-    
+
     // Create displacement field visualization
     cv::Mat dispField;
     cv::cvtColor(refImage, dispField, cv::COLOR_GRAY2BGR);
-    
+
     // Draw displacement vectors (subsampled)
     int step = 10;
     for (int y = 0; y < result.u.rows; y += step) {
-        for (int x = 0; x < result.u.cols; x += step) {
-            if (result.validMask.at<uchar>(y, x)) {
-                double u = result.u.at<double>(y, x);
-                double v = result.v.at<double>(y, x);
-                
-                // Scale displacements for visibility
-                double scale = 5.0;
-                cv::arrowedLine(dispField, cv::Point(x, y), 
-                              cv::Point(x + u * scale, y + v * scale),
-                              cv::Scalar(0, 255, 0), 1, cv::LINE_AA);
-            }
+    for (int x = 0; x < result.u.cols; x += step) {
+        if (result.validMask.at<uchar>(y, x)) {
+            double u = result.u.at<double>(y, x);
+            double v = result.v.at<double>(y, x);
+            
+            // Scale displacements for visibility
+            double scale = 5.0;
+            cv::arrowedLine(dispField, cv::Point(x, y), 
+                        cv::Point(x + u * scale, y + v * scale),
+                        cv::Scalar(0, 255, 0), 1, cv::LINE_AA);
         }
     }
-    
+    }
+
     // Display results
     cv::imshow("U Displacement", uColor);
     cv::imshow("V Displacement", vColor);
     cv::imshow("Displacement Field", dispField);
-    
+    cv::imshow("Valid Points", result.validMask * 255);
+
     // Save results
-    cv::imwrite("E:/code_C++/RGDIC/u_displacement.png", uColor);
-    cv::imwrite("E:/code_C++/RGDIC/v_displacement.png", vColor);
-    cv::imwrite("E:/code_C++/RGDIC/displacement_field.png", dispField);
-    
+    cv::imwrite("u_displacement.png", uColor);
+    cv::imwrite("v_displacement.png", vColor);
+    cv::imwrite("displacement_field.png", dispField);
+    cv::imwrite("valid_points.png", result.validMask * 255);
+
     // If ground truth is available, compute error maps
     if (!trueDispX.empty() && !trueDispY.empty()) {
-        evaluateErrors(result, trueDispX, trueDispY);
+    evaluateErrors(result, trueDispX, trueDispY);
     }
-    
-    cv::waitKey(0);
-}
 
-void RGDIC::evaluateErrors(const DisplacementResult& result, 
-    const cv::Mat& trueDispX, const cv::Mat& trueDispY) {
+    cv::waitKey(0);
+    }
+
+    void RGDIC::evaluateErrors(const DisplacementResult& result, 
+                    const cv::Mat& trueDispX, const cv::Mat& trueDispY) {
     // Convert data types if necessary - ensure all matrices are of the same type
     cv::Mat u, v, trueU, trueV;
     result.u.convertTo(u, CV_32F);
@@ -323,7 +901,7 @@ void RGDIC::evaluateErrors(const DisplacementResult& result,
     cv::subtract(u, trueU, errorU);
     cv::subtract(v, trueV, errorV);
 
-    // Calculate absolute errors - use absdiff to avoid type issues
+    // Calculate absolute errors 
     cv::Mat absErrorU, absErrorV;
     cv::absdiff(u, trueU, absErrorU);
     cv::absdiff(v, trueV, absErrorV);
@@ -387,401 +965,98 @@ void RGDIC::evaluateErrors(const DisplacementResult& result,
     // Display and save error maps
     cv::imshow("U Error Map", errorUColorMasked);
     cv::imshow("V Error Map", errorVColorMasked);
+
+    cv::imwrite("u_error_map.png", errorUColorMasked);
+    cv::imwrite("v_error_map.png", errorVColorMasked);
 }
 
-//--------------------------------------------------------------------
-// ICGNOptimizer Implementation
-//--------------------------------------------------------------------
-
-RGDIC::ICGNOptimizer::ICGNOptimizer(const cv::Mat& refImage, const cv::Mat& defImage,
-                                 int subsetRadius, ShapeFunctionOrder order,
-                                 double convergenceThreshold, int maxIterations)
-    : m_refImage(refImage),
-      m_defImage(defImage),
-      m_subsetRadius(subsetRadius),
-      m_order(order),
-      m_convergenceThreshold(convergenceThreshold),
-      m_maxIterations(maxIterations)
-{
-    // Set number of parameters based on shape function order
-    m_numParams = (order == FIRST_ORDER) ? 6 : 12;
-}
-
-bool RGDIC::ICGNOptimizer::initialGuess(const cv::Point& refPoint, cv::Mat& warpParams, double& zncc)const {
-    // Simple grid search for initial translation parameters
-    int searchRadius = m_subsetRadius; // Search radius
-    double bestZNCC = std::numeric_limits<double>::max(); // Lower ZNCC = better
-    cv::Point bestOffset(0, 0);
-    
-    // Initialize warp params if not already initialized
-    if (warpParams.empty()) {
-        warpParams = cv::Mat::zeros(m_numParams, 1, CV_64F);
+// Add this to rgdic.cpp:
+cv::Mat RGDIC::visualizeDisplacement(const cv::Mat& u, const cv::Mat& v, const cv::Mat& mask) const {
+    cv::Mat validMask;
+    if (mask.empty()) {
+        validMask = cv::Mat(u.size(), CV_8U, cv::Scalar(255));
+    } else {
+        validMask = mask;
     }
     
-    // Perform grid search
-    for (int dy = -searchRadius; dy <= searchRadius; dy += 2) {
-        for (int dx = -searchRadius; dx <= searchRadius; dx += 2) {
-            cv::Point curPoint = refPoint + cv::Point(dx, dy);
-            
-            // Check if within bounds
-            if (curPoint.x >= m_subsetRadius && curPoint.x < m_defImage.cols - m_subsetRadius &&
-                curPoint.y >= m_subsetRadius && curPoint.y < m_defImage.rows - m_subsetRadius) {
+    // Create visualizations for displacement fields
+    cv::Mat uColor, vColor, magnitude;
+    
+    // Find min/max values for normalization
+    double minU, maxU, minV, maxV;
+    cv::minMaxLoc(u, &minU, &maxU, nullptr, nullptr, validMask);
+    cv::minMaxLoc(v, &minV, &maxV, nullptr, nullptr, validMask);
+    
+    // Compute magnitude
+    cv::Mat uSquared, vSquared, magSquared;
+    cv::multiply(u, u, uSquared);
+    cv::multiply(v, v, vSquared);
+    cv::add(uSquared, vSquared, magSquared);
+    cv::sqrt(magSquared, magnitude);
+    
+    double minMag, maxMag;
+    cv::minMaxLoc(magnitude, &minMag, &maxMag, nullptr, nullptr, validMask);
+    
+    // Normalize displacement fields for visualization
+    cv::Mat uNorm, vNorm, magNorm;
+    cv::normalize(u, uNorm, 0, 255, cv::NORM_MINMAX, CV_8U, validMask);
+    cv::normalize(v, vNorm, 0, 255, cv::NORM_MINMAX, CV_8U, validMask);
+    cv::normalize(magnitude, magNorm, 0, 255, cv::NORM_MINMAX, CV_8U, validMask);
+    
+    // Apply color map
+    cv::applyColorMap(uNorm, uColor, cv::COLORMAP_JET);
+    cv::applyColorMap(vNorm, vColor, cv::COLORMAP_JET);
+    cv::Mat magColor;
+    cv::applyColorMap(magNorm, magColor, cv::COLORMAP_JET);
+    
+    // Apply valid mask if provided
+    if (!mask.empty()) {
+        cv::Mat validMask3Ch;
+        cv::cvtColor(validMask, validMask3Ch, cv::COLOR_GRAY2BGR);
+        uColor = uColor.mul(validMask3Ch, 1.0/255.0);
+        vColor = vColor.mul(validMask3Ch, 1.0/255.0);
+        magColor = magColor.mul(validMask3Ch, 1.0/255.0);
+    }
+    
+    // Create a displacement field visualization with arrows
+    cv::Mat dispField = cv::Mat::zeros(u.size(), CV_8UC3);
+    cv::cvtColor(magNorm, dispField, cv::COLOR_GRAY2BGR);
+    
+    // Draw displacement vectors (subsampled)
+    int step = std::max(u.rows, u.cols) / 50; // Adjust for visibility
+    step = std::max(step, 10); // Minimum step size
+    
+    for (int y = 0; y < u.rows; y += step) {
+        for (int x = 0; x < u.cols; x += step) {
+            if (mask.empty() || mask.at<uchar>(y, x)) {
+                double dx = u.at<double>(y, x);
+                double dy = v.at<double>(y, x);
                 
-                // Create simple translation warp
-                cv::Mat testParams = cv::Mat::zeros(m_numParams, 1, CV_64F);
-                testParams.at<double>(0) = dx;
-                testParams.at<double>(1) = dy;
-                
-                // Compute ZNCC
-                double testZNCC = computeZNCC(refPoint, testParams);
-                
-                // Update best match
-                if (testZNCC < bestZNCC) {
-                    bestZNCC = testZNCC;
-                    bestOffset = cv::Point(dx, dy);
-                }
+                // Scale displacements for visibility
+                double scale = 2.0;
+                cv::arrowedLine(dispField, cv::Point(x, y), 
+                              cv::Point(x + dx * scale, y + dy * scale),
+                              cv::Scalar(0, 255, 0), 1, cv::LINE_AA);
             }
         }
     }
     
-    // If no good match found
-    if (bestZNCC == std::numeric_limits<double>::max()) {
-        return false;
-    }
+    // Add text with min/max values
+    std::stringstream ssU, ssV, ssMag;
+    ssU << "U: " << std::fixed << std::setprecision(2) << minU << " to " << maxU;
+    ssV << "V: " << std::fixed << std::setprecision(2) << minV << " to " << maxV;
+    ssMag << "Mag: " << std::fixed << std::setprecision(2) << minMag << " to " << maxMag;
     
-    // Set initial translation parameters
-    warpParams.at<double>(0) = bestOffset.x;
-    warpParams.at<double>(1) = bestOffset.y;
-    zncc = bestZNCC;
+    cv::putText(uColor, ssU.str(), cv::Point(20, 30), cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 0, 0), 2);
+    cv::putText(vColor, ssV.str(), cv::Point(20, 30), cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 0, 0), 2);
+    cv::putText(magColor, ssMag.str(), cv::Point(20, 30), cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 0, 0), 2);
+    cv::putText(dispField, ssMag.str(), cv::Point(20, 30), cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 0, 0), 2);
     
-    return true;
-}
-
-bool RGDIC::ICGNOptimizer::optimize(const cv::Point& refPoint, cv::Mat& warpParams, double& zncc) const {
-    // Initial guess if not provided
-    if (warpParams.at<double>(0) == 0 && warpParams.at<double>(1) == 0) {
-        if (!initialGuess(refPoint, warpParams, zncc)) {
-            return false;
-        }
-    }
+    // Create a combined visualization
+    cv::Mat topRow, bottomRow, fullVis;
+    cv::hconcat(uColor, vColor, topRow);
+    cv::hconcat(magColor, dispField, bottomRow);
+    cv::vconcat(topRow, bottomRow, fullVis);
     
-    // Pre-compute steepest descent images (constant for IC algorithm)
-    std::vector<cv::Mat> steepestDescentImages;
-    computeSteepestDescentImages(refPoint, steepestDescentImages);
-    
-    // Pre-compute Hessian matrix (constant for IC algorithm)
-    cv::Mat hessian;
-    computeHessian(steepestDescentImages, hessian);
-    
-    // Check if Hessian is invertible
-    cv::Mat hessianInv;
-    if (cv::invert(hessian, hessianInv, cv::DECOMP_CHOLESKY) == 0) {
-        return false; // Not invertible
-    }
-    
-    // ICGN main loop
-    double prevZNCC = std::numeric_limits<double>::max();
-    int iter = 0;
-    
-    while (iter < m_maxIterations) {
-        // Compute current ZNCC
-        zncc = computeZNCC(refPoint, warpParams);
-        
-        // Check for convergence
-        if (std::abs(zncc - prevZNCC) < m_convergenceThreshold) {
-            break;
-        }
-        
-        prevZNCC = zncc;
-        
-        // Prepare to calculate error vector
-        cv::Mat errorVector = cv::Mat::zeros(m_numParams, 1, CV_64F);
-        
-        // For each pixel in subset
-        for (int y = -m_subsetRadius; y <= m_subsetRadius; y++) {
-            for (int x = -m_subsetRadius; x <= m_subsetRadius; x++) {
-                // Reference subset coordinates
-                cv::Point2f refSubsetPt(x, y);
-                cv::Point refPixel = refPoint + cv::Point(x, y);
-                
-                // Check if within reference image bounds
-                if (refPixel.x < 0 || refPixel.x >= m_refImage.cols ||
-                    refPixel.y < 0 || refPixel.y >= m_refImage.rows) {
-                    continue;
-                }
-                
-                // Get reference intensity
-                double refIntensity = m_refImage.at<uchar>(refPixel);
-                
-                // Warp point to get corresponding point in deformed image
-                cv::Point2f defPt = warpPoint(refSubsetPt, warpParams);
-                cv::Point2f defImgPt(refPoint.x + defPt.x, refPoint.y + defPt.y);
-                
-                // Check if within deformed image bounds
-                if (defImgPt.x < 0 || defImgPt.x >= m_defImage.cols - 1 ||
-                    defImgPt.y < 0 || defImgPt.y >= m_defImage.rows - 1) {
-                    continue;
-                }
-                
-                // Get deformed intensity (interpolated)
-                double defIntensity = interpolate(m_defImage, defImgPt);
-                
-                // Calculate intensity error
-                double error = refIntensity - defIntensity;
-                
-                // Update error vector
-                for (int p = 0; p < m_numParams; p++) {
-                    errorVector.at<double>(p) += error * steepestDescentImages[p].at<double>(y + m_subsetRadius, x + m_subsetRadius);
-                }
-            }
-        }
-        
-        // Calculate parameter update: Δp = H⁻¹ * error
-        cv::Mat deltaP = hessianInv * errorVector;
-        
-        // Update parameters (inverse compositional update)
-        // For translation parameters, simple addition works
-        warpParams.at<double>(0) += deltaP.at<double>(0);
-        warpParams.at<double>(1) += deltaP.at<double>(1);
-        
-        // For deformation parameters, proper update uses the chain rule
-        // This is a simplification - full IC update is more complex
-        for (int p = 2; p < m_numParams; p++) {
-            warpParams.at<double>(p) += deltaP.at<double>(p);
-        }
-        
-        // Check convergence based on parameter update norm
-        double deltaNorm = cv::norm(deltaP);
-        if (deltaNorm < m_convergenceThreshold) {
-            break;
-        }
-        
-        iter++;
-    }
-    
-    // Final ZNCC calculation
-    zncc = computeZNCC(refPoint, warpParams);
-    
-    return true;
-}
-
-double RGDIC::ICGNOptimizer::computeZNCC(const cv::Point& refPoint, const cv::Mat& warpParams)const {
-    double sumRef = 0, sumDef = 0;
-    double sumRefSq = 0, sumDefSq = 0;
-    double sumRefDef = 0;
-    int count = 0;
-    
-    // For each pixel in subset
-    for (int y = -m_subsetRadius; y <= m_subsetRadius; y++) {
-        for (int x = -m_subsetRadius; x <= m_subsetRadius; x++) {
-            // Reference subset coordinates
-            cv::Point2f refSubsetPt(x, y);
-            cv::Point refPixel = refPoint + cv::Point(x, y);
-            
-            // Check if within reference image bounds
-            if (refPixel.x < 0 || refPixel.x >= m_refImage.cols ||
-                refPixel.y < 0 || refPixel.y >= m_refImage.rows) {
-                continue;
-            }
-            
-            // Get reference intensity
-            double refIntensity = m_refImage.at<uchar>(refPixel);
-            
-            // Warp point to get corresponding point in deformed image
-            cv::Point2f defPt = warpPoint(refSubsetPt, warpParams);
-            cv::Point2f defImgPt(refPoint.x + defPt.x, refPoint.y + defPt.y);
-            
-            // Check if within deformed image bounds
-            if (defImgPt.x < 0 || defImgPt.x >= m_defImage.cols - 1 ||
-                defImgPt.y < 0 || defImgPt.y >= m_defImage.rows - 1) {
-                continue;
-            }
-            
-            // Get deformed intensity (interpolated)
-            double defIntensity = interpolate(m_defImage, defImgPt);
-            
-            // Update sums for ZNCC
-            sumRef += refIntensity;
-            sumDef += defIntensity;
-            sumRefSq += refIntensity * refIntensity;
-            sumDefSq += defIntensity * defIntensity;
-            sumRefDef += refIntensity * defIntensity;
-            count++;
-        }
-    }
-    
-    // Calculate ZNCC if we have enough points
-    if (count > 0) {
-        double meanRef = sumRef / count;
-        double meanDef = sumDef / count;
-        double varRef = sumRefSq / count - meanRef * meanRef;
-        double varDef = sumDefSq / count - meanDef * meanDef;
-        double covar = sumRefDef / count - meanRef * meanDef;
-        
-        if (varRef > 0 && varDef > 0) {
-            // Return 1 - ZNCC to convert to minimization problem (0 is perfect match)
-            return 1.0 - (covar / std::sqrt(varRef * varDef));
-        }
-    }
-    
-    return std::numeric_limits<double>::max(); // Error case
-}
-
-void RGDIC::ICGNOptimizer::computeSteepestDescentImages(const cv::Point& refPoint, 
-                                                     std::vector<cv::Mat>& steepestDescentImages)const {
-    // Calculate image gradients
-    cv::Mat gradX, gradY;
-    cv::Sobel(m_refImage, gradX, CV_64F, 1, 0, 3);
-    cv::Sobel(m_refImage, gradY, CV_64F, 0, 1, 3);
-    
-    // Initialize steepest descent images
-    steepestDescentImages.clear();
-    for (int i = 0; i < m_numParams; i++) {
-        steepestDescentImages.push_back(cv::Mat::zeros(2 * m_subsetRadius + 1, 2 * m_subsetRadius + 1, CV_64F));
-    }
-    
-    // For each pixel in subset
-    for (int y = -m_subsetRadius; y <= m_subsetRadius; y++) {
-        for (int x = -m_subsetRadius; x <= m_subsetRadius; x++) {
-            cv::Point pixel = refPoint + cv::Point(x, y);
-            
-            // Check if within image bounds
-            if (pixel.x < 0 || pixel.x >= m_refImage.cols ||
-                pixel.y < 0 || pixel.y >= m_refImage.rows) {
-                continue;
-            }
-            
-            // Get gradients at this pixel
-            double dx = gradX.at<double>(pixel);
-            double dy = gradY.at<double>(pixel);
-            
-            // Compute Jacobian matrix
-            cv::Mat jacobian;
-            computeWarpJacobian(cv::Point2f(x, y), jacobian);
-            
-            // Compute steepest descent images
-            int row = y + m_subsetRadius;
-            int col = x + m_subsetRadius;
-            
-            // First order parameters
-            steepestDescentImages[0].at<double>(row, col) = dx; // du
-            steepestDescentImages[1].at<double>(row, col) = dy; // dv
-            steepestDescentImages[2].at<double>(row, col) = dx * x; // du/dx
-            steepestDescentImages[3].at<double>(row, col) = dx * y; // du/dy
-            steepestDescentImages[4].at<double>(row, col) = dy * x; // dv/dx
-            steepestDescentImages[5].at<double>(row, col) = dy * y; // dv/dy
-            
-            // Second order parameters (if applicable)
-            if (m_order == SECOND_ORDER) {
-                steepestDescentImages[6].at<double>(row, col) = dx * x * x / 2.0; // d²u/dx²
-                steepestDescentImages[7].at<double>(row, col) = dx * x * y; // d²u/dxdy
-                steepestDescentImages[8].at<double>(row, col) = dx * y * y / 2.0; // d²u/dy²
-                steepestDescentImages[9].at<double>(row, col) = dy * x * x / 2.0; // d²v/dx²
-                steepestDescentImages[10].at<double>(row, col) = dy * x * y; // d²v/dxdy
-                steepestDescentImages[11].at<double>(row, col) = dy * y * y / 2.0; // d²v/dy²
-            }
-        }
-    }
-}
-
-void RGDIC::ICGNOptimizer::computeHessian(const std::vector<cv::Mat>& steepestDescentImages, 
-                                        cv::Mat& hessian) const{
-    // Initialize Hessian matrix
-    hessian = cv::Mat::zeros(m_numParams, m_numParams, CV_64F);
-    
-    // For each parameter pair
-    for (int i = 0; i < m_numParams; i++) {
-        for (int j = i; j < m_numParams; j++) { // Take advantage of symmetry
-            double sum = 0;
-            
-            // Sum over all pixels in subset
-            for (int y = 0; y < 2 * m_subsetRadius + 1; y++) {
-                for (int x = 0; x < 2 * m_subsetRadius + 1; x++) {
-                    sum += steepestDescentImages[i].at<double>(y, x) * steepestDescentImages[j].at<double>(y, x);
-                }
-            }
-            
-            // Set Hessian element
-            hessian.at<double>(i, j) = sum;
-            
-            // Set symmetric element
-            if (i != j) {
-                hessian.at<double>(j, i) = sum;
-            }
-        }
-    }
-}
-
-cv::Point2f RGDIC::ICGNOptimizer::warpPoint(const cv::Point2f& pt, const cv::Mat& warpParams)const {
-    double x = pt.x;
-    double y = pt.y;
-    
-    // Extract parameters
-    double u = warpParams.at<double>(0);
-    double v = warpParams.at<double>(1);
-    double dudx = warpParams.at<double>(2);
-    double dudy = warpParams.at<double>(3);
-    double dvdx = warpParams.at<double>(4);
-    double dvdy = warpParams.at<double>(5);
-    
-    // First-order warp
-    double warpedX = x + u + dudx * x + dudy * y;
-    double warpedY = y + v + dvdx * x + dvdy * y;
-    
-    // Add second-order terms if using second-order shape function
-    if (m_order == SECOND_ORDER && m_numParams >= 12) {
-        double d2udx2 = warpParams.at<double>(6);
-        double d2udxdy = warpParams.at<double>(7);
-        double d2udy2 = warpParams.at<double>(8);
-        double d2vdx2 = warpParams.at<double>(9);
-        double d2vdxdy = warpParams.at<double>(10);
-        double d2vdy2 = warpParams.at<double>(11);
-        
-        warpedX += 0.5 * d2udx2 * x * x + d2udxdy * x * y + 0.5 * d2udy2 * y * y;
-        warpedY += 0.5 * d2vdx2 * x * x + d2vdxdy * x * y + 0.5 * d2vdy2 * y * y;
-    }
-    
-    return cv::Point2f(warpedX, warpedY);
-}
-
-void RGDIC::ICGNOptimizer::computeWarpJacobian(const cv::Point2f& pt, cv::Mat& jacobian)const {
-    double x = pt.x;
-    double y = pt.y;
-    
-    // For first-order shape function
-    if (m_order == FIRST_ORDER) {
-        jacobian = (cv::Mat_<double>(2, 6) << 
-                   1, 0, x, y, 0, 0,
-                   0, 1, 0, 0, x, y);
-    }
-    // For second-order shape function
-    else {
-        jacobian = (cv::Mat_<double>(2, 12) << 
-                   1, 0, x, y, 0, 0, 0.5*x*x, x*y, 0.5*y*y, 0, 0, 0,
-                   0, 1, 0, 0, x, y, 0, 0, 0, 0.5*x*x, x*y, 0.5*y*y);
-    }
-}
-
-double RGDIC::ICGNOptimizer::interpolate(const cv::Mat& image, const cv::Point2f& pt)const {
-    // Bounds check
-    if (pt.x < 0 || pt.x >= image.cols - 1 || pt.y < 0 || pt.y >= image.rows - 1) {
-        return 0;
-    }
-    
-    // Get integer and fractional parts
-    int x1 = static_cast<int>(pt.x);
-    int y1 = static_cast<int>(pt.y);
-    int x2 = x1 + 1;
-    int y2 = y1 + 1;
-    
-    double fx = pt.x - x1;
-    double fy = pt.y - y1;
-    
-    // Bilinear interpolation
-    double val = (1 - fx) * (1 - fy) * image.at<uchar>(y1, x1) +
-                fx * (1 - fy) * image.at<uchar>(y1, x2) +
-                (1 - fx) * fy * image.at<uchar>(y2, x1) +
-                fx * fy * image.at<uchar>(y2, x2);
-    
-    return val;
+    return fullVis;
 }
